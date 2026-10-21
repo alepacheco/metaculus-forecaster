@@ -76,3 +76,16 @@ def test_passes_run_off_the_hour():
     assert next_pass_time(at) == datetime(2026, 10, 21, 14, 7, tzinfo=timezone.utc)
     at = datetime(2026, 10, 21, 14, 7, 0, tzinfo=timezone.utc)
     assert next_pass_time(at) == datetime(2026, 10, 21, 14, 27, tzinfo=timezone.utc)
+
+
+def test_reconciling_with_the_key_never_lowers_spend(tmp_path):
+    b = Budget(tmp_path / "ledger.json", "s", 10.0, 5.0)
+    b.reconcile(100.0)  # first sight: the key had spent 100 before this season
+    b.reserve(1, 1.0)
+    b.settle(1, 1.0, 1.0)
+    b.reconcile(103.0)  # the provider billed 3 since: 2 more than the ledger saw
+    assert b.spent == pytest.approx(3.0)
+    b.reconcile(102.0)
+    assert b.spent == pytest.approx(3.0)
+    again = Budget(tmp_path / "ledger.json", "s", 10.0, 5.0)
+    assert again.key_usage_start == pytest.approx(100.0) and again.spent == pytest.approx(3.0)

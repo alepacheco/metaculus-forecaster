@@ -83,7 +83,11 @@ Give your forecast as a distribution of dates. Set wide intervals: unknown unkno
 Then give your final answer in exactly this format, with dates increasing:
 {lines}"""
     unit = f" in {q.unit}" if q.unit else ""
-    discrete = " The answer is a whole number." if q.type == "discrete" else ""
+    discrete = ""
+    if q.type == "discrete" and q.discrete_step:
+        step = q.discrete_step
+        discrete = (" The answer is a whole number." if abs(step - round(step)) < 1e-9 and round(step) == 1
+                    else f" The answer is a multiple of {step:g}.")
     lines = "\n".join(f"Percentile {p}: X" for p in PERCENTILES)
     return head + f"""
 {_bounds_text(q)}{discrete}

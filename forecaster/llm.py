@@ -10,6 +10,7 @@ import httpx
 from .budget import Budget
 
 OPENROUTER_BASE = "https://openrouter.ai/api/v1"
+TIMED_OUT = 408
 
 
 class ModelError(Exception):
@@ -43,7 +44,7 @@ class Member:
 
 
 class ModelClient:
-    def __init__(self, api_key: str, budget: Budget, max_concurrency: int = 8, timeout: float = 600.0):
+    def __init__(self, api_key: str, budget: Budget, max_concurrency: int = 16, timeout: float = 600.0):
         self.budget = budget
         self._sem = asyncio.Semaphore(max_concurrency)
         self._client = httpx.AsyncClient(
@@ -65,9 +66,12 @@ class ModelClient:
             # A reply without a reported cost is charged at the member's estimate.
             cost = float(usage.get("cost") or 0.0) or member.estimate_usd
         except ModelError as exc:
-            # A failed call may still have been billed; charge a share of the estimate only
-            # when the provider answered (status known), never for transport failures.
-            cost = 0.0 if exc.status in (0, 401, 402, 403, 429) else member.estimate_usd * 0.25
+            # A refused request is not billed; one that timed out may have been, so it is
+            # charged its estimate (the pass's reconciliation with the key corrects either way).
+            cost = member.estimate_usd if exc.status == TIMED_OUT else 0.0
+            raise
+        except asyncio.CancelledError:
+            cost = member.estimate_usd
             raise
         finally:
             self.budget.settle(question_id, member.estimate_usd, cost)
@@ -98,6 +102,8 @@ class ModelClient:
         for attempt in range(3):
             try:
                 response = await self._client.post("/chat/completions", json=body)
+            except httpx.ReadTimeout:
+                raise ModelError(TIMED_OUT)  # not retried: the timed-out call may be billed
             except httpx.TransportError:
                 if attempt == 2:
                     raise ModelError(0)
@@ -119,14 +125,21 @@ class ModelClient:
             return data
         raise ModelError(0)
 
-    async def credit_left(self) -> float | None:
-        """What the key may still spend, if the key has a limit."""
+    async def _key_info(self) -> dict:
         try:
             response = await self._client.get("/key")
             if response.status_code != 200:
-                return None
-            data = response.json().get("data") or {}
-            remaining = data.get("limit_remaining")
-            return float(remaining) if remaining is not None else None
+                return {}
+            return response.json().get("data") or {}
         except (httpx.HTTPError, ValueError):
-            return None
+            return {}
+
+    async def credit_left(self) -> float | None:
+        """What the key may still spend, if the key has a limit."""
+        remaining = (await self._key_info()).get("limit_remaining")
+        return float(remaining) if remaining is not None else None
+
+    async def key_usage(self) -> float | None:
+        """What the key has spent in total, as the provider counts it."""
+        usage = (await self._key_info()).get("usage")
+        return float(usage) if usage is not None else None

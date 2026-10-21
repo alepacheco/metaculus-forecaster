@@ -70,7 +70,10 @@ async def analyse(api: MetaculusClient, records: Records) -> dict:
     rows = []
     open_skipped = 0
     for qid, meta in records.index().items():
-        post = await api.get_post(int(meta["post_id"]))
+        try:
+            post = await api.get_post(int(meta["post_id"]))
+        except Exception:
+            continue
         question = post.get("question") or {}
         if question.get("status") not in CLOSED:
             open_skipped += 1

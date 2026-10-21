@@ -18,6 +18,7 @@ from .metaculus import Question
 
 MAX_BIN_AT_200 = 0.2
 BIN_CAP_MARGIN = 0.95
+UNIFORM_SHARE = 0.011
 
 
 def value_to_location(value: float, q: Question) -> float:
@@ -65,9 +66,16 @@ def percentiles_to_cdf(points: list[tuple[float, float]], q: Question) -> np.nda
     cdf[below] = ps[0] + low_slope * (grid[below] - locs[0])
     cdf[above] = ps[-1] + high_slope * (grid[above] - locs[-1])
     cdf = np.clip(cdf, 0.0, 1.0)
-    if not q.open_lower_bound and not q.open_upper_bound and cdf[-1] - cdf[0] < 0.01:
-        raise ValueError("almost no probability inside a closed range")
+    if _possible_mass(cdf, q) < 0.01:
+        raise ValueError("almost no probability where the question can resolve")
     return cdf
+
+
+def _possible_mass(cdf: np.ndarray, q: Question) -> float:
+    """The probability a CDF puts where the question can resolve (inside, or beyond an open bound)."""
+    floor_at = 0.0 if q.open_lower_bound else cdf[0]
+    top_at = 1.0 if q.open_upper_bound else cdf[-1]
+    return float(top_at - floor_at)
 
 
 def smooth(cdf: np.ndarray) -> np.ndarray:
@@ -94,14 +102,16 @@ def standardize(cdf: np.ndarray, q: Question) -> list[float]:
         raise ValueError("no probability inside the range")
     location = np.linspace(0.0, 1.0, n)
     rescaled = (cdf - floor_at) / mass
+    # A uniform share of 1.1% (a little over the required 1%) keeps every step above the minimum
+    # increment even after rounding.
     if lower_open and upper_open:
-        cdf = 0.988 * rescaled + 0.01 * location + 0.001
+        cdf = 0.987 * rescaled + UNIFORM_SHARE * location + 0.001
     elif lower_open:
-        cdf = 0.989 * rescaled + 0.01 * location + 0.001
+        cdf = 0.988 * rescaled + UNIFORM_SHARE * location + 0.001
     elif upper_open:
-        cdf = 0.989 * rescaled + 0.01 * location
+        cdf = 0.988 * rescaled + UNIFORM_SHARE * location
     else:
-        cdf = 0.99 * rescaled + 0.01 * location
+        cdf = 0.989 * rescaled + UNIFORM_SHARE * location
 
     pmf = np.diff(cdf, prepend=0.0, append=1.0)
     cap = bin_cap(q) * BIN_CAP_MARGIN
@@ -144,7 +154,7 @@ def problems(cdf: list[float], q: Question) -> list[str]:
     if not np.all(np.isfinite(arr)):
         return ["not finite"]
     steps = np.diff(arr)
-    if steps.min() < 0.01 / (n - 1) * 0.99:
+    if steps.min() < 0.01 / (n - 1):
         found.append("increments too small")
     if steps.max() > bin_cap(q) + 1e-9:
         found.append("a bin above the cap")

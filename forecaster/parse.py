@@ -1,10 +1,15 @@
-"""Reading a forecast out of a model's reply."""
+"""Reading a forecast out of a model's reply.
+
+A reply that cannot be read exactly is refused rather than guessed at: the forecaster is
+dropped from the ensemble, and the others carry the forecast.
+"""
 
 from __future__ import annotations
 
 import re
 from datetime import datetime, timezone
 
+from . import cdf
 from .metaculus import Question
 from .prompts import PERCENTILES
 
@@ -13,15 +18,24 @@ class ParseError(ValueError):
     pass
 
 
-_NUMBER = re.compile(r"[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?")
+_NUMBER = r"[-+]?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?"
+# A number written with a magnitude word or suffix ("5k", "7.2 trillion", "3 x 10^6") is refused:
+# the prompt asks for plain numbers in the question's units, and a guess at the scale can be
+# off by a factor of a million.
+_MAGNITUDE = re.compile(
+    rf"({_NUMBER})\s*(?:(thousand|million|billion|trillion|bn|mn|k|m|b|t)(?![a-z])|[x×*]\s*10\s*\^)",
+    re.IGNORECASE,
+)
 
 
 def _clean(text: str) -> str:
-    return text.replace("−", "-").replace("–", "-").replace("*", "").replace("`", "")
+    return (text.replace("−", "-").replace("–", "-").replace("—", "-")
+            .replace("*", "").replace("`", "").replace(" ", " "))
 
 
 def parse_binary(text: str) -> float:
-    matches = re.findall(r"Probability\s*:\s*([0-9]+(?:\.[0-9]+)?)\s*%", _clean(text), re.IGNORECASE)
+    pattern = rf"Probability[^:\n]{{0,24}}:\s*~?\s*({_NUMBER})\s*%"
+    matches = re.findall(pattern, _clean(text), re.IGNORECASE)
     if not matches:
         raise ParseError("no probability")
     value = float(matches[-1]) / 100.0
@@ -35,11 +49,14 @@ def parse_multiple_choice(text: str, options: list[str]) -> list[float]:
     values = []
     for option in options:
         label = re.escape(_clean(option).strip())
-        pattern = rf"^\s*(?:[-•]\s*)?{label}\s*:\s*([0-9]+(?:\.[0-9]+)?)\s*%"
+        pattern = (rf"^\s*(?:[-•]\s*)?(?:(?:\d+|[A-Za-z])[.)]\s+)?[\"'“”]?{label}[\"'“”]?"
+                   rf"\s*[:=-]\s*~?\s*({_NUMBER})\s*%")
         matches = re.findall(pattern, cleaned, re.IGNORECASE | re.MULTILINE)
         if not matches:
             raise ParseError("an option has no probability")
         values.append(float(matches[-1]))
+    if any(v < 0 for v in values):
+        raise ParseError("negative probability")
     total = sum(values)
     if total <= 0:
         raise ParseError("probabilities sum to zero")
@@ -54,32 +71,45 @@ def _parse_value(raw: str, q: Question) -> float:
             raise ParseError("no date")
         moment = datetime.strptime(match.group(0), "%Y-%m-%d").replace(tzinfo=timezone.utc)
         return moment.timestamp()
-    match = _NUMBER.search(raw.replace(",", "").replace(" ", ""))
+    plain = re.sub(r"(?<=\d),(?=\d{3}\b)", "", raw).replace("$", "").replace("€", "").replace("£", "")
+    if _MAGNITUDE.search(plain):
+        raise ParseError("number with a magnitude word")
+    match = re.search(_NUMBER, plain)
     if not match:
         raise ParseError("no number")
     return float(match.group(0))
 
 
+_PERCENTILE_LINE = re.compile(
+    r"^\s*(?:[-•]\s*)?(?:Percentile\s*(\d{1,2})|P(\d{1,2})|(\d{1,2})(?:st|nd|rd|th)\s+percentile)\s*[:=]\s*([^\n]+)",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+
 def parse_percentiles(text: str, q: Question) -> list[tuple[float, float]]:
     """(percentile in 0..1, value) points, strictly increasing in both."""
     found: dict[int, float] = {}
-    for match in re.finditer(r"Percentile\s*(\d{1,2})\s*:\s*([^\n]+)", _clean(text), re.IGNORECASE):
-        level = int(match.group(1))
+    for match in _PERCENTILE_LINE.finditer(_clean(text)):
+        level = int(match.group(1) or match.group(2) or match.group(3))
         if level in PERCENTILES:
-            found[level] = _parse_value(match.group(2), q)
+            found[level] = _parse_value(match.group(4), q)
     if len(found) < 5 or min(found) > 20 or max(found) < 80:
         raise ParseError("too few percentiles")
     levels = sorted(found)
-    values = sorted(found[k] for k in levels)  # a reply with values out of order is read in order
-    span = (q.range_max - q.range_min) if q.range_max is not None and q.range_min is not None else 1.0
-    epsilon = abs(span) * 1e-6 or 1e-6
+    values = [found[k] for k in levels]
+    if any(b < a for a, b in zip(values, values[1:])):
+        raise ParseError("values go down")
+    # Equal neighbours are separated by a hair in the question's scaled location, so the
+    # nudge stays tiny on a logarithmic range too.
     points = []
-    previous = None
+    previous_location = None
     for level, value in zip(levels, values):
-        if previous is not None and value <= previous:
-            value = previous + epsilon
+        location = cdf.value_to_location(value, q)
+        if previous_location is not None and location <= previous_location:
+            location = previous_location + 1e-6
+            value = cdf.location_to_value(location, q)
         points.append((level / 100.0, value))
-        previous = value
+        previous_location = location
     return points
 
 
@@ -92,7 +122,7 @@ def summary(text: str) -> str:
     lines = []
     for line in cleaned[index + len("summary:"):].splitlines():
         stripped = line.strip()
-        if re.match(r"^(Probability|Percentile)\b", stripped, re.IGNORECASE) or re.search(r":\s*[0-9.]+\s*%\s*$", stripped):
+        if re.match(r"^(Probability|Percentile|P\d{1,2}\s*:)", stripped, re.IGNORECASE) or re.search(r"[:=-]\s*~?\s*[0-9.]+\s*%\s*$", stripped):
             break
         if not stripped and lines:
             break

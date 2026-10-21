@@ -7,6 +7,8 @@ import copy
 from forecaster.llm import ModelError, Reply
 from forecaster.metaculus import Question
 
+__all__ = ["Question", "FakeApi", "FakeModels"]
+
 
 def binary_q(qid=1, tournament="fall-test", **kw) -> Question:
     return Question(id=qid, post_id=qid + 1000, type="binary", title="Will it rain?", tournament=tournament, **kw)
@@ -90,6 +92,9 @@ class FakeModels:
 
     async def credit_left(self):
         return 42.0
+
+    async def key_usage(self):
+        return None
 
     async def close(self):
         pass

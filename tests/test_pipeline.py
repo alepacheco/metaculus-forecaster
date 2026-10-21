@@ -16,9 +16,9 @@ UNSAID = re.compile(r"\b(gpt\S*|claude|gemini|grok|openai|anthropic|google|llm|l
 
 
 def make_ctx(tmp_path, questions, budget_cap=100.0, per_question=5.0, replies=None, on_site=(), post=True,
-             fail_models=()):
+             fail_models=(), cost=0.01):
     budget = Budget(tmp_path / "ledger.json", "test", budget_cap, per_question)
-    models = FakeModels(budget, replies=replies, fail_models=fail_models)
+    models = FakeModels(budget, replies=replies, fail_models=fail_models, cost=cost)
     models.questions = {q.id: q for q in questions}
     api = FakeApi(questions, on_site=on_site)
     ctx = Context(api=api, models=models, news=None, budget=budget, records=Records(tmp_path / "records"), post=post)
@@ -159,6 +159,26 @@ def test_main_ensemble_researches_on_the_web_first(tmp_path):
     assert {m for _, m, web in models.calls if not web} == {m.model for m in pipeline.MAIN}
 
 
+@pytest.mark.parametrize("tournament", ["fall-test", "minibench"])
+def test_zero_budget_uses_only_no_cost_models(tmp_path, tournament):
+    q = binary_q(tournament=tournament)
+    ctx, api, models = make_ctx(tmp_path, [q], budget_cap=0.0, cost=0.0)
+    assert ctx.budget.mode == "free" and not ctx.budget.warning
+    assert asyncio.run(forecast_question(ctx, q)) == "done"
+    assert {m for _, m, _ in models.calls} == {m.model for m in pipeline.FREE}
+    assert all(m.endswith(":free") for _, m, _ in models.calls)
+    assert not any(web for _, _, web in models.calls)
+    assert len(api.forecasts) == 1 and len(api.comments) == 1
+
+
+def test_a_charged_call_on_a_zero_budget_stops_the_bot_with_code_3(tmp_path):
+    first, second = binary_q(1), binary_q(7)
+    ctx, api, _ = make_ctx(tmp_path, [first, second], budget_cap=0.0, cost=0.01)
+    code = asyncio.run(run_forever(ctx, ["fall-test"], Health(tmp_path), max_passes=5, sleep=_no_sleep))
+    assert code == EXIT_BUDGET
+    assert ctx.budget.mode == "stopped"
+
+
 def test_spent_budget_stops_the_bot_with_code_3(tmp_path):
     q = binary_q()
     ctx, api, _ = make_ctx(tmp_path, [q], budget_cap=0.05)
@@ -168,10 +188,51 @@ def test_spent_budget_stops_the_bot_with_code_3(tmp_path):
 
 
 def test_every_question_failing_three_passes_exits_with_code_4(tmp_path):
-    q = binary_q()
-    ctx, api, _ = make_ctx(tmp_path, [q], replies=lambda *a: "no forecast here")
+    questions = [binary_q(1), binary_q(2)]
+    ctx, api, _ = make_ctx(tmp_path, questions, replies=lambda *a: "no forecast here")
     code = asyncio.run(run_forever(ctx, ["fall-test"], Health(tmp_path), max_passes=10, sleep=_no_sleep))
     assert code == EXIT_ALL_FAILING
+
+
+def test_one_stuck_question_is_given_up_without_stopping_the_bot(tmp_path):
+    good, stuck = binary_q(1), choice_q(2)
+
+    def replies(qid, member, prompt):
+        if "You are forecasting" not in prompt:
+            return "Research brief."
+        return reply_for(good) if qid == good.id else "1) nothing usable"
+    ctx, api, models = make_ctx(tmp_path, [good, stuck], replies=replies)
+    code = asyncio.run(run_forever(ctx, ["fall-test"], Health(tmp_path), max_passes=6, sleep=_no_sleep))
+    assert code == 0
+    assert [f[0] for f in api.forecasts] == [good.id]
+    stuck_calls = [c for c in models.calls if c[0] == stuck.id]
+    assert len(stuck_calls) == pipeline.MAX_ATTEMPTS * (len(pipeline.MAIN) + 1)
+    assert ctx.records.load(stuck.id)["attempts"] == pipeline.MAX_ATTEMPTS
+
+
+def test_a_second_copy_cannot_take_the_live_directory(tmp_path):
+    from forecaster.__main__ import _hold_lock
+    first = _hold_lock(tmp_path)
+    assert first is not None
+    assert _hold_lock(tmp_path) is None
+    first.close()
+    assert _hold_lock(tmp_path) is not None
+
+
+def test_non_integer_discrete_grid_is_described_and_formatted(tmp_path):
+    from fakes import Question
+    from forecaster.prompts import forecast_prompt
+    q = Question(id=9, post_id=1009, type="discrete", title="Average?", tournament="fall-test",
+                 range_min=0.095, range_max=0.805, nominal_min=0.1, nominal_max=0.8,
+                 open_lower_bound=True, open_upper_bound=True, inbound_outcome_count=71, unit="forecasters")
+    prompt = forecast_prompt(q, "none", "2026-10-21")
+    assert "multiple of 0.01" in prompt and "whole number" not in prompt
+    vals = [0.15, 0.2, 0.25, 0.3, 0.33, 0.36, 0.4, 0.43, 0.46, 0.5, 0.55, 0.6, 0.7]
+    text = "Summary: Steady.\n" + "\n".join(f"Percentile {p}: {v}" for p, v in
+                                             zip((1, 5, 10, 20, 30, 40, 50, 60, 70, 80, 90, 95, 99), vals))
+    ctx, api, _ = make_ctx(tmp_path, [q], replies=lambda *a: text)
+    assert asyncio.run(forecast_question(ctx, q)) == "done"
+    assert "median 0.4" in api.comments[0][1]
 
 
 def test_health_file_has_counts_and_spend_only(tmp_path):

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import math
 import re
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -14,7 +15,7 @@ from . import cdf as cdfs
 from .budget import Budget, BudgetExhausted, QuestionCapReached
 from .llm import Member, ModelClient, ModelError
 from .metaculus import MetaculusClient, Question
-from .parse import ParseError, parse_binary, parse_multiple_choice, parse_percentiles, summary
+from .parse import parse_binary, parse_multiple_choice, parse_percentiles, summary
 from .prompts import forecast_prompt
 from .records import Records
 from .research import NewsClient, gather
@@ -34,12 +35,24 @@ LIGHT = [
     Member("deepseek/deepseek-v4.1-flash", "high", estimate_usd=0.02),
     Member("openai/gpt-6-luna", "high", estimate_usd=0.03),
 ]
+# With no season budget: models offered at no cost, from three labs, the strongest twice;
+# research is news search only (a web-search brief is a paid call).
+FREE = [
+    Member("nvidia/nemotron-3-ultra-550b-a55b:free", "high", estimate_usd=0.0),
+    Member("minimax/minimax-m3.1-flash:free", "high", estimate_usd=0.0),
+    Member("dots-studio/dots-3-note-preview:free", "high", estimate_usd=0.0),
+    Member("nvidia/nemotron-3-ultra-550b-a55b:free", "high", estimate_usd=0.0),
+    Member("minimax/minimax-m3.1-flash:free", "high", estimate_usd=0.0),
+]
+assert all(m.model.endswith(":free") and m.estimate_usd == 0 for m in FREE)
 WEB_RESEARCHER = Member("openai/gpt-6.1-sol", "medium", max_tokens=12000, estimate_usd=0.10)
 MIN_FORECASTS = 2
+MAX_ATTEMPTS = 3  # tries at forecasting (or at posting) one question before giving it up
 
 # Comments carry the forecast and its reasons, and name no model, vendor or AI.
 _UNSAID = re.compile(
-    r"\b(gpt\S*|claude|gemini|grok|deepseek|llama|mistral|qwen|kimi|openai|anthropic|google|deepmind|"
+    r"\b(gpt\S*|claude|gemini|gemma|grok|deepseek|llama|mistral|qwen|kimi|nemotron|nvidia|minimax|inkling|"
+    r"thinking machines|openai|anthropic|google|deepmind|"
     r"xai|x\.ai|openrouter|chatgpt|llms?|language models?|ai|a\.i\.|artificial intelligence|"
     r"machine learning|models?|chatbot|assistant)\b",
     re.IGNORECASE,
@@ -61,6 +74,8 @@ class Context:
 
 
 def choose_ensemble(question: Question, budget: Budget) -> tuple[str, list[Member], Member | None]:
+    if budget.mode == "free":
+        return "free", FREE, None
     if budget.mode != "full" or question.tournament.startswith("minibench"):
         return "light", LIGHT, None
     return "main", MAIN, WEB_RESEARCHER
@@ -87,8 +102,10 @@ def _fmt_number(value: float) -> str:
 def _fmt_value(value: float, q: Question) -> str:
     if q.type == "date":
         return datetime.fromtimestamp(value, timezone.utc).strftime("%Y-%m-%d")
-    if q.type == "discrete":
-        return f"{round(value):,}"
+    step = q.discrete_step
+    if step:
+        decimals = 0 if step >= 1 else max(0, -math.floor(math.log10(step) + 1e-9))
+        return f"{round(value / step) * step:,.{decimals}f}"
     return _fmt_number(value)
 
 
@@ -134,7 +151,7 @@ async def _member(ctx: Context, question: Question, member: Member, prompt: str)
         else:
             entry["forecast"] = parse_percentiles(reply.text, question)
             entry["cdf"] = cdfs.percentiles_to_cdf(entry["forecast"], question).tolist()
-    except (ParseError, ValueError) as exc:
+    except Exception as exc:  # an unusable reply drops this forecaster only
         logs.error(exc, stage="parse", question_id=question.id, question_type=question.type)
         entry["error_type"] = type(exc).__name__
         entry.pop("forecast", None)
@@ -170,7 +187,7 @@ class ModelAccessError(Exception):
 async def _finish(ctx: Context, question: Question, record: dict) -> None:
     """Post what the record holds that is not posted yet: the forecast, then the comment."""
     if not record.get("forecast_posted_at"):
-        if await ctx.api.has_my_forecast(question.post_id) and not ctx.allow_update:
+        if not ctx.allow_update and await ctx.api.has_my_forecast(question.post_id):
             record["forecast_posted_at"] = "found-on-site"
         else:
             await ctx.api.post_forecast(question, record["value"])
@@ -188,8 +205,15 @@ async def forecast_question(ctx: Context, question: Question) -> str:
     if record and record.get("value") is not None:
         if record.get("comment_posted_at") or not ctx.post:
             return "already_done"
+        if record.get("finish_attempts", 0) >= MAX_ATTEMPTS:
+            return "gave_up"
+        record["finish_attempts"] = record.get("finish_attempts", 0) + 1
+        ctx.records.save(question.id, record)
         await _finish(ctx, question, record)
         return "completed"
+    attempts = (record or {}).get("attempts", 0)
+    if attempts >= MAX_ATTEMPTS:
+        return "gave_up"
     if not ctx.allow_update and ctx.post:
         # The question list does not say whether we forecast a question; its page does.
         if question.has_my_forecast or await ctx.api.has_my_forecast(question.post_id):
@@ -198,27 +222,30 @@ async def forecast_question(ctx: Context, question: Question) -> str:
         return "budget"
 
     ensemble_name, ensemble, researcher = choose_ensemble(question, ctx.budget)
+    record = {
+        "question": {"id": question.id, "post_id": question.post_id, "type": question.type,
+                     "title": question.title, "tournament": question.tournament,
+                     "open_time": question.open_time, "scheduled_close_time": question.scheduled_close_time},
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "attempts": attempts + 1,
+        "ensemble": ensemble_name,
+        "backtest": ctx.backtest,
+        "value": None,
+    }
+    # Saved before any paid call, so a question that keeps failing is given up after a few tries.
+    ctx.records.save(question.id, record)
     as_of = question.open_timestamp() if ctx.backtest else None
     try:
-        research = await gather(question, ctx.models, ctx.news, researcher, as_of=as_of)
+        research = await gather(question, ctx.models, ctx.news, researcher, as_of=as_of,
+                                background=not question.tournament.startswith("minibench"))
     except BudgetExhausted:
         return "budget"
     today = datetime.fromtimestamp(as_of, timezone.utc) if as_of else datetime.now(timezone.utc)
     prompt = forecast_prompt(question, research, today.strftime("%Y-%m-%d"))
     members = await asyncio.gather(*[_member(ctx, question, m, prompt) for m in ensemble])
     valid = [m for m in members if "forecast" in m]
-    record = {
-        "question": {"id": question.id, "post_id": question.post_id, "type": question.type,
-                     "title": question.title, "tournament": question.tournament,
-                     "open_time": question.open_time, "scheduled_close_time": question.scheduled_close_time},
-        "created_at": datetime.now(timezone.utc).isoformat(),
-        "ensemble": ensemble_name,
-        "backtest": ctx.backtest,
-        "research": research,
-        "members": members,
-        "cost_usd": round(ctx.budget.question_spent(question.id), 6),
-        "value": None,
-    }
+    record.update({"research": research, "members": members,
+                   "cost_usd": round(ctx.budget.question_spent(question.id), 6)})
     if len(valid) < MIN_FORECASTS:
         ctx.records.save(question.id, record)
         if all(m.get("auth") for m in members):
@@ -226,7 +253,11 @@ async def forecast_question(ctx: Context, question: Question) -> str:
         if any(m.get("error_type") == "BudgetExhausted" for m in members):
             return "budget"
         raise NoForecast()
-    value, closest = _aggregate(question, valid)
+    try:
+        value, closest = _aggregate(question, valid)
+    except Exception:
+        ctx.records.save(question.id, record)
+        raise NoForecast()
     record["value"] = value
     record["comment"] = comment_text(question, value, summary(closest.get("text", "")))
     ctx.records.save(question.id, record)

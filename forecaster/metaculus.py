@@ -54,6 +54,13 @@ class Question:
         return (self.inbound_outcome_count or 200) + 1
 
     @property
+    def discrete_step(self) -> float | None:
+        """The spacing of a discrete question's possible answers."""
+        if self.type != "discrete" or not self.inbound_outcome_count or self.range_max is None or self.range_min is None:
+            return None
+        return (self.range_max - self.range_min) / self.inbound_outcome_count
+
+    @property
     def is_continuous(self) -> bool:
         return self.type in ("numeric", "discrete", "date")
 
@@ -120,12 +127,14 @@ class MetaculusClient:
     async def close(self) -> None:
         await self._client.aclose()
 
-    async def _request(self, method: str, path: str, **kwargs) -> dict | list:
+    async def _request(self, method: str, path: str, retry: bool = True, **kwargs) -> dict | list:
+        """A request; reads are retried on 429 and 5xx. Posts are not (a retry after a lost
+        reply could post twice); the next pass finishes them from the record instead."""
         delay = 2.0
         for attempt in range(4):
             response = await self._client.request(method, path, **kwargs)
             if response.status_code == 429 or response.status_code >= 500:
-                if attempt == 3:
+                if attempt == 3 or not retry:
                     raise ApiError(response.status_code)
                 await asyncio.sleep(delay)
                 delay *= 3
@@ -149,7 +158,9 @@ class MetaculusClient:
             page = await self._request("GET", "/posts/", params={
                 "tournaments": tournament,
                 "statuses": statuses,
-                "forecast_type": ",".join(SUPPORTED_TYPES),
+                # Groups are listed too, so the log counts them as unsupported rather than
+                # missing them silently.
+                "forecast_type": ",".join(SUPPORTED_TYPES + ("group_of_questions",)),
                 "include_description": "true",
                 "order_by": order_by,
                 "limit": limit,
@@ -185,10 +196,10 @@ class MetaculusClient:
         return bool(question and question.has_my_forecast)
 
     async def post_forecast(self, question: Question, value: object) -> None:
-        await self._request("POST", "/questions/forecast/", json=[forecast_payload(question, value)])
+        await self._request("POST", "/questions/forecast/", retry=False, json=[forecast_payload(question, value)])
 
     async def post_comment(self, post_id: int, text: str) -> None:
-        await self._request("POST", "/comments/create/", json={
+        await self._request("POST", "/comments/create/", retry=False, json={
             "text": text,
             "parent": None,
             "included_forecast": True,

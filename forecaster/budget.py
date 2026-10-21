@@ -2,6 +2,8 @@
 
 Every paid call's cost is added per question and per season. Near the season's cap the bot
 switches to a cheaper ensemble and raises a warning; at the cap it makes no more paid calls.
+A season budget of zero means no paid calls at all: the bot uses only no-cost models, and
+stops if any call is ever charged.
 """
 
 from __future__ import annotations
@@ -32,6 +34,7 @@ class Budget:
         self.per_question: dict[str, float] = {}
         self._reserved = 0.0
         self._reserved_per_question: dict[str, float] = {}
+        self.key_usage_start: float | None = None
         self._lock = threading.Lock()
         self._load()
 
@@ -42,19 +45,36 @@ class Budget:
         season = data.get(self.label, {})
         self.spent = float(season.get("spent_usd", 0.0))
         self.per_question = {k: float(v) for k, v in season.get("per_question_usd", {}).items()}
+        self.key_usage_start = season.get("key_usage_start")
 
     def _save(self) -> None:
         if self.path is None:
             return
         data = json.loads(self.path.read_text()) if self.path.exists() else {}
         data[self.label] = {"spent_usd": round(self.spent, 6),
+                            "key_usage_start": self.key_usage_start,
                             "per_question_usd": {k: round(v, 6) for k, v in self.per_question.items()}}
         tmp = self.path.with_suffix(".tmp")
         tmp.write_text(json.dumps(data, indent=1))
         os.replace(tmp, self.path)
 
+    def reconcile(self, key_usage: float) -> None:
+        """Count at least what the model key itself reports spent since this season began
+        (calls that timed out or were cut off are billed but report no cost)."""
+        with self._lock:
+            if self.key_usage_start is None:
+                self.key_usage_start = key_usage - self.spent
+                self._save()
+                return
+            billed = key_usage - self.key_usage_start
+            if billed > self.spent:
+                self.spent = billed
+                self._save()
+
     @property
     def mode(self) -> str:
+        if self.season_cap <= 0:
+            return "free" if self.spent <= 0 else "stopped"
         if self.spent >= self.season_cap:
             return "stopped"
         if self.spent >= STEP_DOWN_FRACTION * self.season_cap:
@@ -63,7 +83,7 @@ class Budget:
 
     @property
     def warning(self) -> bool:
-        return self.mode != "full"
+        return self.mode in ("reduced", "stopped")
 
     def question_spent(self, question_id: int) -> float:
         return self.per_question.get(str(question_id), 0.0)

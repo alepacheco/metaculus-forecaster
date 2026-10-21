@@ -64,3 +64,21 @@ def test_location_round_trip_on_log_scale():
     q = log_q()
     for value in (1.0, 10.0, 500.0, 10000.0):
         assert abs(cdf.location_to_value(cdf.value_to_location(value, q), q) - value) < 1e-6 * value
+
+
+def test_a_member_wholly_outside_a_range_with_one_closed_bound_is_refused():
+    upper_closed = numeric_q(open_lower_bound=True, open_upper_bound=False)
+    with pytest.raises(ValueError):
+        cdf.percentiles_to_cdf([(0.1, 200.0), (0.5, 300.0), (0.9, 400.0)], upper_closed)
+    lower_closed = numeric_q(open_lower_bound=False, open_upper_bound=True)
+    with pytest.raises(ValueError):
+        cdf.percentiles_to_cdf([(0.1, -400.0), (0.5, -300.0), (0.9, -200.0)], lower_closed)
+
+
+def test_minimum_increment_holds_exactly_on_a_flat_forecast():
+    from fakes import Question
+    q = Question(id=9, post_id=1009, type="discrete", title="x", tournament="t", range_min=0.095, range_max=0.805,
+                 open_lower_bound=True, open_upper_bound=True, inbound_outcome_count=71)
+    final = cdf.standardize(cdf.percentiles_to_cdf([(0.1, 0.2), (0.5, 0.3), (0.9, 0.4)], q), q)
+    assert np.diff(final).min() >= 0.01 / 71
+    assert cdf.problems(final, q) == []

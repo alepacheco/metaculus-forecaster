@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import fcntl
 import json
 import sys
 from pathlib import Path
@@ -46,9 +47,24 @@ async def _close(*clients) -> None:
             await c.close()
 
 
+def _hold_lock(live_dir: Path):
+    """One copy of the bot per live directory: a second would double its spend and its posts."""
+    handle = open(live_dir / ".lock", "w")
+    try:
+        fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        handle.close()
+        return None
+    return handle
+
+
 async def cmd_run(args) -> int:
     config = load_config()
     logs.setup(config.live_dir / "bot.log")
+    lock = _hold_lock(config.live_dir)
+    if lock is None:
+        logs.event("exit", reason="already_running")
+        return 1
     budget = Budget(config.live_dir / "ledger.json", config.budget_label,
                     config.season_budget_usd, config.per_question_cap_usd)
     api, models, news = _clients(config.secrets, budget)
@@ -68,6 +84,7 @@ async def cmd_run(args) -> int:
         return await run_forever(ctx, config.tournaments, health)
     finally:
         await _close(api, models, news)
+        lock.close()
 
 
 async def cmd_dry_run(args) -> int:
@@ -175,13 +192,15 @@ def main(argv: list[str] | None = None) -> int:
         if name == "analyse":
             s.add_argument("--records")
     args = parser.parse_args(argv)
-    if args.command in ("run", "pass"):
-        return asyncio.run(cmd_run(args))
-    if args.command == "dry-run":
-        return asyncio.run(cmd_dry_run(args))
-    if args.command == "analyse":
-        return asyncio.run(cmd_analyse(args))
-    return asyncio.run(cmd_check(args))
+    command = {"run": cmd_run, "pass": cmd_run, "dry-run": cmd_dry_run,
+               "analyse": cmd_analyse, "check": cmd_check}[args.command]
+    try:
+        return asyncio.run(command(args))
+    except KeyboardInterrupt:
+        return 0
+    except Exception as exc:  # the log gets the error's type and place, never a traceback's text
+        logs.error(exc, stage="main")
+        return 1
 
 
 if __name__ == "__main__":

@@ -18,6 +18,9 @@ a private comment explaining it. Nobody reviews or edits a forecast.
   into a valid 201-point (or discrete-size) CDF within Metaculus's per-bin cap.
 - MiniBench questions, and every question once 80% of the season's budget is spent, use a
   cheaper ensemble without the web-search brief.
+- With a season budget of 0 it makes no paid calls at all: five forecasts from models offered
+  at no cost (three labs), news search as its only research, and it stops if a call is ever
+  charged.
 
 ## Running it
 
