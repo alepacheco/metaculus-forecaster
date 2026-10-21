@@ -1,0 +1,188 @@
+"""Command line.
+
+  python -m forecaster run                 forecast every 20 minutes until stopped (the live bot)
+  python -m forecaster pass [--tournament SLUG ...] [--allow-update]
+                                           one pass now (--allow-update only in the testing area)
+  python -m forecaster dry-run --tournament SLUG --out DIR [--per-type N] [--budget USD] [--backtest]
+                                           forecast closed or resolved questions without posting
+  python -m forecaster analyse [--records DIR]
+                                           scores on resolved questions
+  python -m forecaster check               are the keys working (prints ok or failed per key)
+"""
+
+from __future__ import annotations
+
+import argparse
+import asyncio
+import json
+import sys
+from pathlib import Path
+
+from . import logs
+from .analyse import analyse
+from .budget import Budget
+from .config import load_config, load_secrets
+from .health import Health
+from .llm import ModelClient
+from .metaculus import MetaculusClient, Question
+from .pipeline import Context, forecast_question
+from .records import Records
+from .research import NewsClient
+from .runner import run_forever, run_pass
+
+TESTING_AREA = "bot-testing-area"
+
+
+def _clients(secrets: dict[str, str], budget: Budget):
+    api = MetaculusClient(secrets["METACULUS_TOKEN"])
+    models = ModelClient(secrets.get("OPENROUTER_API_KEY", ""), budget)
+    news = NewsClient(secrets["ASKNEWS_API_KEY"]) if secrets.get("ASKNEWS_API_KEY") else None
+    return api, models, news
+
+
+async def _close(*clients) -> None:
+    for c in clients:
+        if c is not None:
+            await c.close()
+
+
+async def cmd_run(args) -> int:
+    config = load_config()
+    logs.setup(config.live_dir / "bot.log")
+    budget = Budget(config.live_dir / "ledger.json", config.budget_label,
+                    config.season_budget_usd, config.per_question_cap_usd)
+    api, models, news = _clients(config.secrets, budget)
+    ctx = Context(api=api, models=models, news=news, budget=budget, records=Records(config.records_dir))
+    health = Health(config.live_dir)
+    logs.event("start", tournaments=len(config.tournaments), budget_mode=budget.mode)
+    try:
+        if args.command == "pass":
+            tournaments = args.tournament or config.tournaments
+            if args.allow_update and tournaments != [TESTING_AREA]:
+                print("--allow-update is only for the testing area", file=sys.stderr)
+                return 1
+            ctx.allow_update = args.allow_update
+            result = await run_pass(ctx, tournaments, health)
+            health.write(tournaments, budget, await models.credit_left(), None, result.open_now)
+            return 0 if not result.failed else 1
+        return await run_forever(ctx, config.tournaments, health)
+    finally:
+        await _close(api, models, news)
+
+
+async def cmd_dry_run(args) -> int:
+    secrets = load_secrets(Path(args.secret_file))
+    out = Path(args.out)
+    out.mkdir(parents=True, exist_ok=True)
+    logs.setup(out / "dry-run.log")
+    budget = Budget(out / "ledger.json", "dry-run", args.budget, args.per_question_cap)
+    api, models, news = _clients(secrets, budget)
+    ctx = Context(api=api, models=models, news=news, budget=budget, records=Records(out / "records"),
+                  post=False, backtest=args.backtest)
+    try:
+        if "open" in args.statuses.split(",") and args.tournament != TESTING_AREA:
+            print("dry runs use closed or resolved questions only", file=sys.stderr)
+            return 1
+        posts = await api.list_posts(args.tournament, statuses=args.statuses, max_posts=args.max_posts,
+                                     order_by="-actual_close_time" if "open" not in args.statuses else "-open_time")
+        chosen: list[Question] = []
+        per_type: dict[str, int] = {}
+        for post in posts:
+            q = Question.from_post(post, args.tournament)
+            if q is None or (args.tournament != TESTING_AREA and q.status not in ("closed", "resolved")):
+                continue
+            if per_type.get(q.type, 0) >= args.per_type:
+                continue
+            per_type[q.type] = per_type.get(q.type, 0) + 1
+            chosen.append(q)
+        logs.event("dry_run_selected", questions=len(chosen), **{k: v for k, v in sorted(per_type.items())})
+        outcomes: dict[str, int] = {}
+
+        async def one(q: Question) -> str:
+            async with ctx.question_semaphore:
+                try:
+                    return await forecast_question(ctx, q)
+                except Exception as exc:
+                    logs.error(exc, stage="dry_run", question_id=q.id, question_type=q.type)
+                    return "failed"
+
+        for outcome in await asyncio.gather(*[one(q) for q in chosen]):
+            outcomes[outcome] = outcomes.get(outcome, 0) + 1
+        logs.event("dry_run_done", spent_usd=budget.spent, **outcomes)
+        return 0 if not outcomes.get("failed") else 1
+    finally:
+        await _close(api, models, news)
+
+
+async def cmd_analyse(args) -> int:
+    secrets = load_secrets(Path(args.secret_file))
+    records_dir = Path(args.records) if args.records else load_config().records_dir
+    api = MetaculusClient(secrets["METACULUS_TOKEN"])
+    try:
+        print(json.dumps(await analyse(api, Records(records_dir)), indent=1))
+    finally:
+        await api.close()
+    return 0
+
+
+async def cmd_check(args) -> int:
+    secrets = load_secrets(Path(args.secret_file))
+    budget = Budget(None, "check", 0.0, 0.0)
+    api, models, news = _clients(secrets, budget)
+    status = {}
+    try:
+        try:
+            me = await api.me()
+            status["metaculus"] = "ok" if me.get("is_bot") else "ok-not-a-bot-account"
+        except Exception as exc:
+            status["metaculus"] = f"failed:{type(exc).__name__}"
+        credit = await models.credit_left()
+        status["openrouter"] = "ok" if credit is not None else "failed-or-no-limit"
+        status["openrouter_credit_usd"] = credit
+        if news is None:
+            status["asknews"] = "no-key"
+        else:
+            try:
+                await news.search("global news", 1, "latest news")
+                status["asknews"] = "ok"
+            except Exception as exc:
+                status["asknews"] = f"failed:{type(exc).__name__}"
+    finally:
+        await _close(api, models, news)
+    print(json.dumps(status))
+    return 0 if all(v == "ok" or k == "openrouter_credit_usd" for k, v in status.items()) else 1
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(prog="forecaster")
+    sub = parser.add_subparsers(dest="command", required=True)
+    sub.add_parser("run")
+    p = sub.add_parser("pass")
+    p.add_argument("--tournament", action="append")
+    p.add_argument("--allow-update", action="store_true")
+    d = sub.add_parser("dry-run")
+    d.add_argument("--tournament", required=True)
+    d.add_argument("--out", required=True)
+    d.add_argument("--statuses", default="resolved")
+    d.add_argument("--per-type", type=int, default=2)
+    d.add_argument("--max-posts", type=int, default=300)
+    d.add_argument("--budget", type=float, default=5.0)
+    d.add_argument("--per-question-cap", type=float, default=2.0)
+    d.add_argument("--backtest", action="store_true")
+    for name in ("dry-run", "analyse", "check"):
+        s = d if name == "dry-run" else sub.add_parser(name)
+        s.add_argument("--secret-file", default="/secret/bot.env")
+        if name == "analyse":
+            s.add_argument("--records")
+    args = parser.parse_args(argv)
+    if args.command in ("run", "pass"):
+        return asyncio.run(cmd_run(args))
+    if args.command == "dry-run":
+        return asyncio.run(cmd_dry_run(args))
+    if args.command == "analyse":
+        return asyncio.run(cmd_analyse(args))
+    return asyncio.run(cmd_check(args))
+
+
+if __name__ == "__main__":
+    sys.exit(main())
