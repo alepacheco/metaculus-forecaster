@@ -71,6 +71,19 @@ def test_errors_log_type_and_place_not_message(tmp_path):
     assert "85%" not in text and "model said" not in text
 
 
+def test_http_errors_log_their_status_code_only(tmp_path):
+    from forecaster.research import NewsError
+    log_file = tmp_path / "bot.log"
+    logs.setup(log_file)
+    try:
+        raise NewsError(403)
+    except NewsError as exc:
+        logs.error(exc, stage="research", question_id=9, question_type="numeric")
+    text = log_file.read_text()
+    assert "type=NewsError" in text and "status=403" in text and "failed" not in text
+    assert logs.recent_errors().get("research:NewsError:403", 0) >= 1  # health.json's errors_24h
+
+
 def test_passes_run_off_the_hour():
     at = datetime(2026, 10, 21, 13, 50, 5, tzinfo=timezone.utc)
     assert next_pass_time(at) == datetime(2026, 10, 21, 14, 7, tzinfo=timezone.utc)

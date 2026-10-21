@@ -47,8 +47,10 @@ web search is off. `analyse` scores the bot on resolved questions.
 ## What it writes
 
 - `live/health.json` each pass: counts of questions seen, done, skipped and failed in the last
-  24 hours, spend, credit left, budget warning, and the last error's type.
-- `live/bot.log`: the same counts, and errors as their type, place, question id and type.
+  24 hours, spend, credit left, budget warning, the last error's type, and the errors of the
+  last 24 hours counted by stage, type and HTTP status.
+- `live/bot.log`: the same counts, and errors as their type, place, question id and type (and
+  HTTP status, for a failed request).
 - `live/records/<question id>.json`: each question's full record, used by the bot to finish a
   question interrupted mid-way and by `analyse` once the question has closed.
 

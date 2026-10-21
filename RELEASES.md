@@ -10,3 +10,5 @@ kept between 2% and 98% and a 1% floor on each option. Posts one forecast and on
 comment per question, finishes an interrupted question from its own record, and keeps to the
 season's budget: a cheaper ensemble near the limit, no more spending at it. With no budget
 for the season it forecasts with no-cost models only (three labs, news search for research).
+Its health file and log carry counts, costs and error types only, with each failed request's
+status code, so a blocked source shows without reading any forecast.

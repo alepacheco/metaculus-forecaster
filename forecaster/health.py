@@ -7,7 +7,7 @@ import os
 import time
 from pathlib import Path
 
-from . import __version__
+from . import __version__, logs
 
 DONE = {"done", "completed", "already_done"}
 SKIPPED = {"skipped_existing"}
@@ -77,6 +77,7 @@ class Health:
             "credit_left_usd": round(credit_left, 4) if credit_left is not None else None,
             "last_error_type": self.last_error_type,
             "last_error_at": self.last_error_at,
+            "errors_24h": logs.recent_errors(),
         }
         tmp = self.path.with_suffix(".tmp")
         tmp.write_text(json.dumps(data, indent=1))

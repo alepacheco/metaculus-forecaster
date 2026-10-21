@@ -89,6 +89,19 @@ def test_comments_name_no_model_vendor_or_ai(tmp_path):
     assert not UNSAID.search(text)
 
 
+def test_the_comment_uses_the_nearest_forecaster_that_gave_reasons(tmp_path):
+    def replies(qid, member, prompt):
+        if "You are forecasting" not in prompt:
+            return "Research brief."
+        if not member.model.startswith("minimax/"):  # three of five, the median among them: no reasons
+            return "Probability: 40%"
+        return "Summary: The harvest reports point to an early finish.\nProbability: 60%"
+    q = binary_q()
+    ctx, api, _ = make_ctx(tmp_path, [q], budget_cap=0.0, replies=replies, cost=0.0)
+    assert asyncio.run(forecast_question(ctx, q)) == "done"
+    assert "harvest reports" in api.comments[0][1]
+
+
 @pytest.mark.parametrize("make", ALL)
 def test_comment_lines_are_clean_for_every_type(tmp_path, make):
     q = make()

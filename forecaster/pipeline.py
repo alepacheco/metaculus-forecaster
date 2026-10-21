@@ -159,21 +159,29 @@ async def _member(ctx: Context, question: Question, member: Member, prompt: str)
 
 
 def _aggregate(question: Question, members: list[dict]):
+    """The ensemble's forecast, and its forecasters ordered from closest to it to farthest."""
     valid = [m for m in members if "forecast" in m]
     if question.type == "binary":
         value = aggregate.binary([m["forecast"] for m in valid])
-        closest = min(valid, key=lambda m: abs(m["forecast"] - value))
-        return value, closest
+        return value, sorted(valid, key=lambda m: abs(m["forecast"] - value))
     if question.type == "multiple_choice":
         probs = aggregate.multiple_choice([m["forecast"] for m in valid])
         value = dict(zip(question.options, probs))
-        closest = min(valid, key=lambda m: sum(abs(a - b) for a, b in zip(m["forecast"], probs)))
-        return value, closest
+        return value, sorted(valid, key=lambda m: sum(abs(a - b) for a, b in zip(m["forecast"], probs)))
     member_cdfs = [np.asarray(m["cdf"]) for m in valid]
     value = aggregate.continuous(member_cdfs, question)
-    target = float(np.interp(0.5, value, np.linspace(0, 1, len(value))))
-    closest = min(valid, key=lambda m: abs(float(np.interp(0.5, m["cdf"], np.linspace(0, 1, len(m["cdf"])))) - target))
-    return value, closest
+    grid = np.linspace(0, 1, len(value))
+    target = float(np.interp(0.5, value, grid))
+    return value, sorted(valid, key=lambda m: abs(float(np.interp(0.5, m["cdf"], grid)) - target))
+
+
+def _reasons(ranked: list[dict]) -> str:
+    """The summary of the forecaster closest to the ensemble that has one that may be said."""
+    for member in ranked:
+        reasons = clean_sentences(summary(member.get("text", "")))
+        if reasons:
+            return reasons
+    return ""
 
 
 class NoForecast(Exception):
@@ -254,12 +262,12 @@ async def forecast_question(ctx: Context, question: Question) -> str:
             return "budget"
         raise NoForecast()
     try:
-        value, closest = _aggregate(question, valid)
+        value, ranked = _aggregate(question, valid)
     except Exception:
         ctx.records.save(question.id, record)
         raise NoForecast()
     record["value"] = value
-    record["comment"] = comment_text(question, value, summary(closest.get("text", "")))
+    record["comment"] = comment_text(question, value, _reasons(ranked))
     ctx.records.save(question.id, record)
     if not ctx.post:
         return "done"
