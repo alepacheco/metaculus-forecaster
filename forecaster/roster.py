@@ -2,7 +2,8 @@
 quietly shrink the ensemble.
 
 A model is out while the provider's public list lacks it (or its listed expiry has passed),
-and for a day after a call to it answered "not found". Each member whose model is out is
+and for a day after a call to it answered "not found" or "forbidden" (a model the provider
+lists but no longer serves to this key). Each member whose model is out is
 replaced by the first model of its ensemble's reserve that is in, else by the members that
 are in, in turn, so the ensemble keeps its number of forecasts.
 """
@@ -17,14 +18,14 @@ from . import logs
 from .llm import Member
 
 REFRESH_SECONDS = 3600  # the provider's list is read at most this often
-NOT_FOUND_SECONDS = 86400  # a model that answered "not found" is tried again after this
+OUT_SECONDS = 86400  # a model that answered "not found" or "forbidden" is tried again after this
 
 
 class Roster:
     def __init__(self) -> None:
         self.listed: set[str] | None = None  # None until the list has been read once
         self.refreshed_at = 0.0
-        self.not_found: dict[str, float] = {}
+        self.answered_out: dict[str, float] = {}  # model -> when a call to it answered that it is out
         self._lock = asyncio.Lock()
 
     async def refresh(self, models) -> None:
@@ -37,16 +38,16 @@ class Roster:
             if listed:
                 self.listed = listed
 
-    def mark_not_found(self, model: str) -> None:
+    def mark_out(self, model: str, status: int) -> None:
         if self.is_in(model):
-            logs.event("model_out", model=model, reason="not_found")
-        self.not_found[model] = time.time()
+            logs.event("model_out", model=model, status=status)
+        self.answered_out[model] = time.time()
 
     def is_in(self, model: str) -> bool:
         if self.listed is not None and model not in self.listed:
             return False
-        at = self.not_found.get(model)
-        return at is None or time.time() - at >= NOT_FOUND_SECONDS
+        at = self.answered_out.get(model)
+        return at is None or time.time() - at >= OUT_SECONDS
 
     def out(self, models: Iterable[str]) -> list[str]:
         return sorted({m for m in models if not self.is_in(m)})

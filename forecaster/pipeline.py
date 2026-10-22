@@ -13,7 +13,7 @@ import numpy as np
 from . import aggregate, logs
 from . import cdf as cdfs
 from .budget import Budget, BudgetExhausted, QuestionCapReached
-from .llm import NOT_FOUND, Member, ModelClient, ModelError
+from .llm import Member, ModelClient, ModelError
 from .metaculus import MetaculusClient, Question
 from .parse import parse_binary, parse_multiple_choice, parse_percentiles, summary
 from .prompts import forecast_prompt
@@ -37,21 +37,21 @@ LIGHT = [
     Member("openai/gpt-6-luna", "high", estimate_usd=0.03),
 ]
 # With no season budget: models offered at no cost, picked by how the organisers' single-model
-# bots of them scored with news on the last full season's questions; research is news search
+# bots of them scored with news on the last full season's questions: the one with a scored season
+# that is offered to this key three times, two newer ones beside it; research is news search
 # only (a web-search brief is a paid call). Free models come and go: one withdrawn is replaced
-# by the first of FREE_RESERVE still offered (models with no scored season yet, other labs first).
+# by the first of FREE_RESERVE still offered.
 FREE = [
-    Member("thinkingmachines/inkling:free", "high", estimate_usd=0.0),
     Member("nvidia/nemotron-3-ultra-550b-a55b:free", "high", estimate_usd=0.0),
-    Member("thinkingmachines/inkling-small:free", "high", estimate_usd=0.0),
-    Member("thinkingmachines/inkling:free", "high", estimate_usd=0.0),
+    Member("dots-studio/dots-3-note-preview:free", "high", estimate_usd=0.0),
+    Member("nvidia/nemotron-3-ultra-550b-a55b:free", "high", estimate_usd=0.0),
+    Member("nvidia/nemotron-3.5-super-vl:free", "high", estimate_usd=0.0),
     Member("nvidia/nemotron-3-ultra-550b-a55b:free", "high", estimate_usd=0.0),
 ]
 FREE_RESERVE = [
-    Member("dots-studio/dots-3-note-preview:free", "high", estimate_usd=0.0),
     Member("google/gemma-4-31b-it:free", "high", estimate_usd=0.0),
+    Member("google/gemma-4-26b-a4b-it:free", "high", estimate_usd=0.0),
     Member("nvidia/nemotron-3-super-120b-a12b:free", "high", estimate_usd=0.0),
-    Member("nvidia/nemotron-3.5-super-vl:free", "high", estimate_usd=0.0),
 ]
 assert all(m.model.endswith(":free") and m.estimate_usd == 0 for m in FREE + FREE_RESERVE)
 RESERVES = {"free": FREE_RESERVE}
@@ -161,8 +161,9 @@ def comment_text(question: Question, value, reasons: str) -> str:
 
 async def _member(ctx: Context, question: Question, slot: int, base: list[Member], reserve: list[Member],
                   prompt: str) -> dict:
-    """One forecaster's forecast. A model that is not offered any more is replaced at once by the
-    roster's substitute for this slot, so the question keeps its number of forecasts."""
+    """One forecaster's forecast. A model that is not offered any more (or not to this key) is
+    replaced at once by the roster's substitute for this slot, so the question keeps its number
+    of forecasts."""
     tried: list[str] = []
     entry: dict = {}
     while len(tried) < MAX_TRIES_PER_MEMBER:
@@ -171,9 +172,9 @@ async def _member(ctx: Context, question: Question, slot: int, base: list[Member
             break
         tried.append(member.model)
         entry = await _ask(ctx, question, slot, member, prompt)
-        if entry.get("error_status") != NOT_FOUND:
+        if not entry.get("model_out"):
             break
-        ctx.roster.mark_not_found(member.model)
+        ctx.roster.mark_out(member.model, entry["error_status"])
     if len(tried) > 1:
         entry["models_tried"] = tried
     return entry
@@ -192,6 +193,7 @@ async def _ask(ctx: Context, question: Question, slot: int, member: Member, prom
         entry["error_type"] = type(exc).__name__
         if isinstance(exc, ModelError):
             entry["error_status"] = exc.status
+            entry["model_out"] = exc.is_model_out
         entry["auth"] = bool(isinstance(exc, ModelError) and (exc.is_auth or exc.is_credit))
         return entry
     entry["text"] = reply.text

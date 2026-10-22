@@ -12,8 +12,9 @@ from .budget import Budget
 
 OPENROUTER_BASE = "https://openrouter.ai/api/v1"
 TIMED_OUT = 408
-NOT_FOUND = 404  # the model is not offered (any more)
+MODEL_OUT = (403, 404)  # the model is not offered (any more), or not to this key
 EMPTY_REPLY = -1
+BUSY = (429, 502, 503)  # an error in a reply's body that is asked again: the provider was busy or down
 EMPTY_REPLY_TRIES = 2  # an empty reply is asked for once more
 
 
@@ -30,6 +31,10 @@ class ModelError(Exception):
     @property
     def is_credit(self) -> bool:
         return self.status == 402
+
+    @property
+    def is_model_out(self) -> bool:
+        return self.status in MODEL_OUT
 
 
 @dataclass
@@ -127,18 +132,21 @@ class ModelClient:
                 delay *= 3
                 continue
             if response.status_code == 429 or response.status_code >= 500:
-                if attempt == 2:
-                    raise ModelError(response.status_code)
-                await asyncio.sleep(delay)
-                delay *= 3
-                continue
-            if response.status_code >= 400:
+                status = response.status_code
+            elif response.status_code >= 400:
                 raise ModelError(response.status_code)
-            data = response.json()
-            if isinstance(data, dict) and data.get("error"):
+            else:
+                data = response.json()
+                if not (isinstance(data, dict) and data.get("error")):
+                    return data
                 code = data["error"].get("code") if isinstance(data["error"], dict) else 0
-                raise ModelError(int(code) if isinstance(code, int) else 0)
-            return data
+                status = int(code) if isinstance(code, int) else 0
+                if status not in BUSY:
+                    raise ModelError(status)
+            if attempt == 2:
+                raise ModelError(status)
+            await asyncio.sleep(delay)
+            delay *= 3
         raise ModelError(0)
 
     async def listed_models(self) -> set[str] | None:

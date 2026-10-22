@@ -7,18 +7,18 @@ import httpx
 import pytest
 
 from fakes import FakeApi, FakeModels, binary_q, numeric_q
-from forecaster import logs, pipeline
+from forecaster import llm, logs, pipeline
 from forecaster.__main__ import main
 from forecaster.budget import Budget
 from forecaster.health import Health
 from forecaster.llm import EMPTY_REPLY, Member, ModelClient, ModelError
 from forecaster.pipeline import Context, forecast_question
 from forecaster.records import Records
-from forecaster.roster import NOT_FOUND_SECONDS, Roster
+from forecaster.roster import OUT_SECONDS, Roster
 from forecaster.runner import EXIT_ALL_FAILING, run_forever
 
-INKLING = "thinkingmachines/inkling:free"
-NEMOTRON = "nvidia/nemotron-3-ultra-550b-a55b:free"
+NEMOTRON = "nvidia/nemotron-3-ultra-550b-a55b:free"  # three of the five forecasters
+DOTS = "dots-studio/dots-3-note-preview:free"  # the second forecaster
 FREE_IDS = {m.model for m in pipeline.FREE + pipeline.FREE_RESERVE}
 
 
@@ -33,27 +33,36 @@ def free_ctx(tmp_path, questions, **models_kw):
 
 def test_a_withdrawn_free_model_is_replaced_within_the_same_question(tmp_path):
     first, second = binary_q(1), binary_q(2)
-    ctx, api, models = free_ctx(tmp_path, [first, second], gone_models={INKLING})
+    ctx, api, models = free_ctx(tmp_path, [first, second], gone_models={NEMOTRON})
     assert asyncio.run(forecast_question(ctx, first)) == "done"
     record = ctx.records.load(first.id)
     assert len([m for m in record["members"] if "forecast" in m]) == len(pipeline.FREE)
     used = [m["model"] for m in record["members"]]
-    reserve = [m.model for m in pipeline.FREE_RESERVE]
-    assert INKLING not in used and reserve[0] in used and reserve[1] in used
-    assert 1 <= sum(1 for c in models.calls if c[1] == INKLING) <= 2  # at most once for each of its slots
+    assert NEMOTRON not in used and all(m.model in used for m in pipeline.FREE_RESERVE)
+    assert 1 <= sum(1 for c in models.calls if c[1] == NEMOTRON) <= 3  # at most once for each of its slots
     models.calls.clear()
     assert asyncio.run(forecast_question(ctx, second)) == "done"
-    assert INKLING not in {c[1] for c in models.calls}  # not asked again for a day
+    assert NEMOTRON not in {c[1] for c in models.calls}  # not asked again for a day
     assert len(models.calls) == len(pipeline.FREE) and len(api.forecasts) == 2
+
+
+def test_a_model_that_refuses_this_key_is_replaced_like_a_withdrawn_one(tmp_path):
+    q = binary_q()
+    ctx, api, models = free_ctx(tmp_path, [q], refused_models={DOTS})
+    assert asyncio.run(forecast_question(ctx, q)) == "done"
+    record = ctx.records.load(q.id)
+    assert len([m for m in record["members"] if "forecast" in m]) == len(pipeline.FREE)
+    assert record["members"][1]["models_tried"] == [DOTS, pipeline.FREE_RESERVE[0].model]
+    assert pipeline.models_out(ctx) == [DOTS] and len(api.forecasts) == 1
 
 
 def test_a_model_the_provider_no_longer_lists_is_never_called(tmp_path):
     q = binary_q()
-    ctx, api, models = free_ctx(tmp_path, [q], listed=FREE_IDS - {NEMOTRON})
+    ctx, api, models = free_ctx(tmp_path, [q], listed=FREE_IDS - {DOTS})
     assert asyncio.run(forecast_question(ctx, q)) == "done"
     called = [c[1] for c in models.calls]
-    assert NEMOTRON not in called and len(called) == len(pipeline.FREE)
-    assert pipeline.models_out(ctx) == [NEMOTRON]
+    assert DOTS not in called and len(called) == len(pipeline.FREE)
+    assert pipeline.models_out(ctx) == [DOTS]
 
 
 def test_an_unreadable_model_list_leaves_the_ensemble_as_written(tmp_path):
@@ -65,12 +74,12 @@ def test_an_unreadable_model_list_leaves_the_ensemble_as_written(tmp_path):
 
 def test_health_names_the_models_out(tmp_path):
     q = binary_q()
-    ctx, _, _ = free_ctx(tmp_path, [q], gone_models={INKLING})
+    ctx, _, _ = free_ctx(tmp_path, [q], gone_models={DOTS})
     code = asyncio.run(run_forever(ctx, ["fall-test"], Health(tmp_path), max_passes=1, sleep=_no_sleep))
     assert code == 0
     data = json.loads((tmp_path / "health.json").read_text())
-    assert data["models_out"] == [INKLING]
-    assert data["errors_24h"].get("member1:ModelError:404", 0) >= 1
+    assert data["models_out"] == [DOTS]
+    assert data["errors_24h"].get("member2:ModelError:404", 0) >= 1
     assert data["last_24h"]["posted"] == 1
 
 
@@ -94,11 +103,11 @@ def test_the_roster_fills_from_the_members_still_in_when_the_reserve_is_spent():
     assert roster.ensemble([a, b], [spare]) == [a, b]  # nothing known to be in: as written
 
 
-def test_a_model_that_answered_not_found_is_tried_again_after_a_day():
+def test_a_model_that_answered_it_is_out_is_tried_again_after_a_day():
     roster = Roster()
-    roster.mark_not_found("lab/a:free")
+    roster.mark_out("lab/a:free", 404)
     assert not roster.is_in("lab/a:free")
-    roster.not_found["lab/a:free"] = time.time() - NOT_FOUND_SECONDS - 1
+    roster.answered_out["lab/a:free"] = time.time() - OUT_SECONDS - 1
     assert roster.is_in("lab/a:free")
 
 
@@ -148,6 +157,35 @@ def test_two_empty_replies_fail_with_the_finish_reason_logged_not_any_text(tmp_p
     logs.error(raised.value, stage="member3", question_id=1, question_type="binary", model="lab/a:free")
     text = log_file.read_text()
     assert "stage=member3" in text and "model=lab/a:free" in text and "status=-1 reason=length" in text
+
+
+def test_a_busy_provider_reported_in_the_reply_body_is_asked_again(monkeypatch):
+    answers = [{"error": {"code": 503, "message": "busy"}},
+               {"choices": [{"message": {"content": "Probability: 40%"}, "finish_reason": "stop"}],
+                "usage": {"cost": 0}}]
+    seen = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return httpx.Response(200, json=answers.pop(0))
+    monkeypatch.setattr(llm.asyncio, "sleep", _no_sleep)
+    client = ModelClient("key", Budget(None, "t", 0.0, 1.0))
+    client._client = httpx.AsyncClient(base_url="https://example.invalid", transport=httpx.MockTransport(handler))
+    reply = asyncio.run(client.complete(1, Member("lab/a:free", estimate_usd=0.0), "prompt"))
+    assert reply.text == "Probability: 40%" and len(seen) == 2
+
+
+def test_another_error_in_the_reply_body_is_not_asked_again():
+    seen = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return httpx.Response(200, json={"error": {"code": 400, "message": "bad request"}})
+    client = ModelClient("key", Budget(None, "t", 0.0, 1.0))
+    client._client = httpx.AsyncClient(base_url="https://example.invalid", transport=httpx.MockTransport(handler))
+    with pytest.raises(ModelError) as raised:
+        asyncio.run(client.complete(1, Member("lab/a:free", estimate_usd=0.0), "prompt"))
+    assert raised.value.status == 400 and len(seen) == 1
 
 
 def test_the_provider_list_drops_models_past_their_expiry():

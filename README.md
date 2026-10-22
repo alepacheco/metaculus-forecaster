@@ -21,9 +21,10 @@ a private comment explaining it. Nobody reviews or edits a forecast.
 - With a season budget of 0 it makes no paid calls at all: five forecasts from models offered
   at no cost, news search as its only research, and it stops if a call is ever charged.
 - **Withdrawn models**: the provider's list of offered models is read every hour. A forecaster
-  whose model is gone (no longer listed, past its listed expiry, or answering "not found") is
-  replaced at once, in the same question, by the next model of a reserve that is still offered,
-  else by another member of the ensemble, so the ensemble keeps its five forecasts.
+  whose model is gone (no longer listed, past its listed expiry, or answering "not found" or
+  "forbidden") is replaced at once, in the same question, by the next model of a reserve that is
+  still offered, else by another member of the ensemble, so the ensemble keeps its five
+  forecasts.
 
 ## Running it
 
@@ -54,7 +55,7 @@ see that it answers.
 - `live/health.json` each pass: counts of questions seen, done, skipped and failed in the last
   24 hours, spend, credit left, budget warning, the last error's type, the errors of the last
   24 hours counted by stage (a forecaster's by its place in the ensemble), type and HTTP status,
-  and the models out (withdrawn by the provider and replaced).
+  and the models out (withdrawn by the provider or refused to this key, and replaced).
 - `live/bot.log`: the same counts, and errors as their type, place, question id and type (and
   HTTP status for a failed request, the model for a forecaster's error, the finish reason for
   an empty reply).

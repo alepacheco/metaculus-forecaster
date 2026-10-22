@@ -1,5 +1,21 @@
 # Releases
 
+## v2
+
+Keeps the ensemble whole when the provider withdraws a model. One of the no-cost models was
+withdrawn early in the season, which left two of the five forecasts failing on every question.
+Now the bot reads the provider's list of offered models every hour: a forecaster whose model is
+no longer listed, is past its listed expiry, or answers "not found" or "forbidden" is replaced in
+the same question by the next model of a reserve, else by another member, so every question
+keeps five forecasts; the health file names the models out. The no-cost ensemble was re-picked
+by how the organisers' single-model bots of these models scored with news in the last full
+season (Summer 2026), among the models that answer this key: the one with a scored season three
+times, with two newer models beside it. An empty reply is asked for once more before it counts
+as a failure, and each failed forecaster is logged with its place in the ensemble and its model.
+Comments put a currency symbol before the number ("$2,500"), a one-off pass takes only the
+configured tournaments or the testing area, and the health file's last error comes from every
+error logged.
+
 ## v1
 
 First version. Forecasts every question type the tournaments use (binary, multiple choice,

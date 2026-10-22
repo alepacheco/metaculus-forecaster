@@ -93,7 +93,7 @@ def test_the_comment_uses_the_nearest_forecaster_that_gave_reasons(tmp_path):
     def replies(qid, member, prompt):
         if "You are forecasting" not in prompt:
             return "Research brief."
-        if not member.model.startswith("nvidia/"):  # three of five, the median among them: no reasons
+        if member.model == pipeline.FREE[0].model:  # three of five, the median among them: no reasons
             return "Probability: 40%"
         return "Summary: The harvest reports point to an early finish.\nProbability: 60%"
     q = binary_q()
