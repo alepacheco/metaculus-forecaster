@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
+from datetime import date
 
 import httpx
 
@@ -11,12 +12,16 @@ from .budget import Budget
 
 OPENROUTER_BASE = "https://openrouter.ai/api/v1"
 TIMED_OUT = 408
+NOT_FOUND = 404  # the model is not offered (any more)
+EMPTY_REPLY = -1
+EMPTY_REPLY_TRIES = 2  # an empty reply is asked for once more
 
 
 class ModelError(Exception):
-    def __init__(self, status: int = 0):
+    def __init__(self, status: int = 0, reason: str | None = None):
         super().__init__(f"model call failed ({status})")
         self.status = status
+        self.reason = reason  # for an empty reply, the provider's finish reason
 
     @property
     def is_auth(self) -> bool:
@@ -58,6 +63,19 @@ class ModelClient:
 
     async def complete(self, question_id: int, member: Member, prompt: str,
                        web_search: bool = False) -> Reply:
+        """The member's reply. An empty one (a refusal, or reasoning that used up its tokens) is
+        asked for once more before it counts as a failure."""
+        cost = 0.0
+        finish = None
+        for _ in range(EMPTY_REPLY_TRIES):
+            text, call_cost, finish = await self._complete_once(question_id, member, prompt, web_search)
+            cost += call_cost
+            if text.strip():
+                return Reply(text=text, cost=cost, model=member.model)
+        raise ModelError(EMPTY_REPLY, reason=finish)
+
+    async def _complete_once(self, question_id: int, member: Member, prompt: str,
+                             web_search: bool) -> tuple[str, float, str | None]:
         self.budget.reserve(question_id, member.estimate_usd)
         cost = 0.0
         try:
@@ -76,12 +94,10 @@ class ModelClient:
         finally:
             self.budget.settle(question_id, member.estimate_usd, cost)
         choices = data.get("choices") or []
-        text = ""
-        if choices:
-            text = (choices[0].get("message") or {}).get("content") or ""
-        if not text.strip():
-            raise ModelError(-1)
-        return Reply(text=text, cost=cost, model=member.model)
+        if not choices:
+            return "", cost, None
+        text = (choices[0].get("message") or {}).get("content") or ""
+        return text, cost, choices[0].get("finish_reason")
 
     async def _call(self, member: Member, prompt: str, web_search: bool) -> dict:
         body: dict = {
@@ -124,6 +140,27 @@ class ModelClient:
                 raise ModelError(int(code) if isinstance(code, int) else 0)
             return data
         raise ModelError(0)
+
+    async def listed_models(self) -> set[str] | None:
+        """The models the provider offers now (its public list, less any past its listed expiry),
+        or None when the list cannot be read."""
+        try:
+            response = await self._client.get("/models")
+            if response.status_code != 200:
+                return None
+            entries = response.json().get("data") or []
+        except (httpx.HTTPError, ValueError, AttributeError):
+            return None
+        today = date.today().isoformat()
+        listed = set()
+        for entry in entries:
+            if not isinstance(entry, dict) or not entry.get("id"):
+                continue
+            expires = entry.get("expiration_date")
+            if isinstance(expires, str) and expires[:10] < today:
+                continue
+            listed.add(str(entry["id"]))
+        return listed or None
 
     async def _key_info(self) -> dict:
         try:

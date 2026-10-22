@@ -19,16 +19,10 @@ class Health:
         self.live_dir = live_dir
         self.events_path = live_dir / "events.jsonl"
         self.path = live_dir / "health.json"
-        self.last_error_type: str | None = None
-        self.last_error_at: str | None = None
 
     def outcome(self, question_id: int, outcome: str) -> None:
         with self.events_path.open("a") as f:
             f.write(json.dumps({"ts": int(time.time()), "qid": int(question_id), "outcome": outcome}) + "\n")
-
-    def error(self, exc: BaseException) -> None:
-        self.last_error_type = type(exc).__name__
-        self.last_error_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
     def _last_day(self) -> dict:
         now = int(time.time())
@@ -60,7 +54,9 @@ class Health:
         }
 
     def write(self, tournaments: list[str], budget, credit_left: float | None,
-              pass_seconds: float | None, open_now: int, state: str = "running") -> dict:
+              pass_seconds: float | None, open_now: int, state: str = "running",
+              models_out: list[str] | None = None) -> dict:
+        last_error_type, last_error_at = logs.last_error()
         data = {
             "version": __version__,
             "state": state,
@@ -75,9 +71,11 @@ class Health:
             "budget_mode": budget.mode,
             "budget_warning": budget.warning,
             "credit_left_usd": round(credit_left, 4) if credit_left is not None else None,
-            "last_error_type": self.last_error_type,
-            "last_error_at": self.last_error_at,
+            "last_error_type": last_error_type,
+            "last_error_at": last_error_at,
             "errors_24h": logs.recent_errors(),
+            # Models of the ensemble in use that the provider no longer offers; each is replaced.
+            "models_out": models_out or [],
         }
         tmp = self.path.with_suffix(".tmp")
         tmp.write_text(json.dumps(data, indent=1))

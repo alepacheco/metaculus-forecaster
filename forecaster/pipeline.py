@@ -13,12 +13,13 @@ import numpy as np
 from . import aggregate, logs
 from . import cdf as cdfs
 from .budget import Budget, BudgetExhausted, QuestionCapReached
-from .llm import Member, ModelClient, ModelError
+from .llm import NOT_FOUND, Member, ModelClient, ModelError
 from .metaculus import MetaculusClient, Question
 from .parse import parse_binary, parse_multiple_choice, parse_percentiles, summary
 from .prompts import forecast_prompt
 from .records import Records
 from .research import NewsClient, gather
+from .roster import Roster
 
 # The ensembles. Forecasters from several labs, each thinking hard, five forecasts a question.
 MAIN = [
@@ -35,24 +36,34 @@ LIGHT = [
     Member("deepseek/deepseek-v4.1-flash", "high", estimate_usd=0.02),
     Member("openai/gpt-6-luna", "high", estimate_usd=0.03),
 ]
-# With no season budget: models offered at no cost, from three labs, the strongest twice;
-# research is news search only (a web-search brief is a paid call).
+# With no season budget: models offered at no cost, picked by how the organisers' single-model
+# bots of them scored with news on the last full season's questions; research is news search
+# only (a web-search brief is a paid call). Free models come and go: one withdrawn is replaced
+# by the first of FREE_RESERVE still offered (models with no scored season yet, other labs first).
 FREE = [
+    Member("thinkingmachines/inkling:free", "high", estimate_usd=0.0),
     Member("nvidia/nemotron-3-ultra-550b-a55b:free", "high", estimate_usd=0.0),
-    Member("minimax/minimax-m3.1-flash:free", "high", estimate_usd=0.0),
-    Member("dots-studio/dots-3-note-preview:free", "high", estimate_usd=0.0),
+    Member("thinkingmachines/inkling-small:free", "high", estimate_usd=0.0),
+    Member("thinkingmachines/inkling:free", "high", estimate_usd=0.0),
     Member("nvidia/nemotron-3-ultra-550b-a55b:free", "high", estimate_usd=0.0),
-    Member("minimax/minimax-m3.1-flash:free", "high", estimate_usd=0.0),
 ]
-assert all(m.model.endswith(":free") and m.estimate_usd == 0 for m in FREE)
+FREE_RESERVE = [
+    Member("dots-studio/dots-3-note-preview:free", "high", estimate_usd=0.0),
+    Member("google/gemma-4-31b-it:free", "high", estimate_usd=0.0),
+    Member("nvidia/nemotron-3-super-120b-a12b:free", "high", estimate_usd=0.0),
+    Member("nvidia/nemotron-3.5-super-vl:free", "high", estimate_usd=0.0),
+]
+assert all(m.model.endswith(":free") and m.estimate_usd == 0 for m in FREE + FREE_RESERVE)
+RESERVES = {"free": FREE_RESERVE}
 WEB_RESEARCHER = Member("openai/gpt-6.1-sol", "medium", max_tokens=12000, estimate_usd=0.10)
 MIN_FORECASTS = 2
+MAX_TRIES_PER_MEMBER = 4  # models tried for one forecaster of one question, substitutes included
 MAX_ATTEMPTS = 3  # tries at forecasting (or at posting) one question before giving it up
 
 # Comments carry the forecast and its reasons, and name no model, vendor or AI.
 _UNSAID = re.compile(
     r"\b(gpt\S*|claude|gemini|gemma|grok|deepseek|llama|mistral|qwen|kimi|nemotron|nvidia|minimax|inkling|"
-    r"thinking machines|openai|anthropic|google|deepmind|"
+    r"thinking ?machines|dots[- ]?3\S*|dots[- ]studio|openai|anthropic|google|deepmind|"
     r"xai|x\.ai|openrouter|chatgpt|llms?|language models?|ai|a\.i\.|artificial intelligence|"
     r"machine learning|models?|chatbot|assistant)\b",
     re.IGNORECASE,
@@ -71,6 +82,7 @@ class Context:
     backtest: bool = False
     allow_update: bool = False
     question_semaphore: asyncio.Semaphore = field(default_factory=lambda: asyncio.Semaphore(4))
+    roster: Roster = field(default_factory=Roster)
 
 
 def choose_ensemble(question: Question, budget: Budget) -> tuple[str, list[Member], Member | None]:
@@ -79,6 +91,18 @@ def choose_ensemble(question: Question, budget: Budget) -> tuple[str, list[Membe
     if budget.mode != "full" or question.tournament.startswith("minibench"):
         return "light", LIGHT, None
     return "main", MAIN, WEB_RESEARCHER
+
+
+def models_in_use(mode: str) -> list[str]:
+    """Every model the bot may call in its budget mode, reserves included."""
+    members = {"free": FREE + FREE_RESERVE, "full": MAIN + LIGHT + [WEB_RESEARCHER],
+               "reduced": LIGHT}.get(mode, [])
+    return sorted({m.model for m in members})
+
+
+def models_out(ctx: Context) -> list[str]:
+    """The models the bot may call now that the provider no longer offers (health.json names them)."""
+    return ctx.roster.out(models_in_use(ctx.budget.mode))
 
 
 def clean_sentences(text: str) -> str:
@@ -109,16 +133,22 @@ def _fmt_value(value: float, q: Question) -> str:
     return _fmt_number(value)
 
 
+_CURRENCY = re.compile(r"^(US\$|[$€£¥₹])\s*(.*)$")
+
+
 def forecast_line(question: Question, value) -> str:
     if question.type == "binary":
         return f"Forecast: {value * 100:.1f}% chance of Yes."
     if question.type == "multiple_choice":
         parts = [f"{option}: {value[option] * 100:.1f}%" for option in question.options]
         return "Forecast: " + "; ".join(parts) + "."
-    unit = f" {question.unit}" if question.unit and question.type != "date" else ""
-    median = _fmt_value(cdfs.quantile(value, question, 0.5), question)
-    low = _fmt_value(cdfs.quantile(value, question, 0.1), question)
-    high = _fmt_value(cdfs.quantile(value, question, 0.9), question)
+    median, low, high = (_fmt_value(cdfs.quantile(value, question, p), question) for p in (0.5, 0.1, 0.9))
+    unit = question.unit.strip() if question.type != "date" else ""
+    currency = _CURRENCY.match(unit)
+    if currency:  # a currency symbol goes before each number ("$2,500"), any word after it
+        symbol, unit = currency.groups()
+        median, low, high = (f"{symbol}{v}" for v in (median, low, high))
+    unit = f" {unit}" if unit else ""
     return f"Forecast: median {median}{unit}; 80% interval {low} to {high}{unit}."
 
 
@@ -129,16 +159,39 @@ def comment_text(question: Question, value, reasons: str) -> str:
     return f"{forecast_line(question, value)}\n\n{reasons}"
 
 
-async def _member(ctx: Context, question: Question, member: Member, prompt: str) -> dict:
-    entry: dict = {"model": member.model, "effort": member.effort}
+async def _member(ctx: Context, question: Question, slot: int, base: list[Member], reserve: list[Member],
+                  prompt: str) -> dict:
+    """One forecaster's forecast. A model that is not offered any more is replaced at once by the
+    roster's substitute for this slot, so the question keeps its number of forecasts."""
+    tried: list[str] = []
+    entry: dict = {}
+    while len(tried) < MAX_TRIES_PER_MEMBER:
+        member = ctx.roster.ensemble(base, reserve)[slot]
+        if member.model in tried:
+            break
+        tried.append(member.model)
+        entry = await _ask(ctx, question, slot, member, prompt)
+        if entry.get("error_status") != NOT_FOUND:
+            break
+        ctx.roster.mark_not_found(member.model)
+    if len(tried) > 1:
+        entry["models_tried"] = tried
+    return entry
+
+
+async def _ask(ctx: Context, question: Question, slot: int, member: Member, prompt: str) -> dict:
+    entry: dict = {"slot": slot + 1, "model": member.model, "effort": member.effort}
     try:
         reply = await ctx.models.complete(question.id, member, prompt)
     except (BudgetExhausted, QuestionCapReached) as exc:
         entry["error_type"] = type(exc).__name__
         return entry
     except Exception as exc:
-        logs.error(exc, stage="member", question_id=question.id, question_type=question.type)
+        logs.error(exc, stage=f"member{slot + 1}", question_id=question.id, question_type=question.type,
+                   model=member.model)
         entry["error_type"] = type(exc).__name__
+        if isinstance(exc, ModelError):
+            entry["error_status"] = exc.status
         entry["auth"] = bool(isinstance(exc, ModelError) and (exc.is_auth or exc.is_credit))
         return entry
     entry["text"] = reply.text
@@ -152,7 +205,8 @@ async def _member(ctx: Context, question: Question, member: Member, prompt: str)
             entry["forecast"] = parse_percentiles(reply.text, question)
             entry["cdf"] = cdfs.percentiles_to_cdf(entry["forecast"], question).tolist()
     except Exception as exc:  # an unusable reply drops this forecaster only
-        logs.error(exc, stage="parse", question_id=question.id, question_type=question.type)
+        logs.error(exc, stage="parse", question_id=question.id, question_type=question.type,
+                   model=member.model)
         entry["error_type"] = type(exc).__name__
         entry.pop("forecast", None)
     return entry
@@ -230,6 +284,8 @@ async def forecast_question(ctx: Context, question: Question) -> str:
         return "budget"
 
     ensemble_name, ensemble, researcher = choose_ensemble(question, ctx.budget)
+    reserve = RESERVES.get(ensemble_name, [])
+    await ctx.roster.refresh(ctx.models)
     record = {
         "question": {"id": question.id, "post_id": question.post_id, "type": question.type,
                      "title": question.title, "tournament": question.tournament,
@@ -250,7 +306,8 @@ async def forecast_question(ctx: Context, question: Question) -> str:
         return "budget"
     today = datetime.fromtimestamp(as_of, timezone.utc) if as_of else datetime.now(timezone.utc)
     prompt = forecast_prompt(question, research, today.strftime("%Y-%m-%d"))
-    members = await asyncio.gather(*[_member(ctx, question, m, prompt) for m in ensemble])
+    members = await asyncio.gather(*[_member(ctx, question, slot, ensemble, reserve, prompt)
+                                     for slot in range(len(ensemble))])
     valid = [m for m in members if "forecast" in m]
     record.update({"research": research, "members": members,
                    "cost_usd": round(ctx.budget.question_spent(question.id), 6)})

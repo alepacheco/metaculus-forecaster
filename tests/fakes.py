@@ -64,10 +64,12 @@ def reply_for(question: Question, marker: str = "") -> str:
 
 
 class FakeModels:
-    def __init__(self, budget, replies=None, fail_models=(), cost=0.01):
+    def __init__(self, budget, replies=None, fail_models=(), cost=0.01, gone_models=(), listed=None):
         self.budget = budget
         self.replies = replies  # callable(question_id, member, prompt) -> text, or None for well-formed
         self.fail_models = set(fail_models)
+        self.gone_models = set(gone_models)  # answer "not found", as a withdrawn model does
+        self.listed = listed  # the provider's list of models, or None when it cannot be read
         self.cost = cost
         self.calls = []
         self.questions: dict[int, Question] = {}
@@ -77,6 +79,8 @@ class FakeModels:
         self.budget.reserve(question_id, member.estimate_usd)
         cost = 0.0
         try:
+            if member.model in self.gone_models:
+                raise ModelError(404)
             if member.model in self.fail_models:
                 raise ModelError(500)
             cost = self.cost
@@ -89,6 +93,9 @@ class FakeModels:
         finally:
             self.budget.settle(question_id, member.estimate_usd, cost)
         return Reply(text=text, cost=cost, model=member.model)
+
+    async def listed_models(self):
+        return set(self.listed) if self.listed is not None else None
 
     async def credit_left(self):
         return 42.0

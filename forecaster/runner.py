@@ -22,7 +22,7 @@ from . import logs
 from .budget import BudgetExhausted
 from .health import Health
 from .metaculus import ApiError, Question
-from .pipeline import Context, ModelAccessError, forecast_question
+from .pipeline import Context, ModelAccessError, forecast_question, models_out
 
 PASS_MINUTES = (7, 27, 47)
 PASS_TIMEOUT_SECONDS = 3600
@@ -67,7 +67,6 @@ async def run_pass(ctx: Context, tournaments: list[str], health: Health,
             found, unsupported = await ctx.api.open_questions(tournament)
         except (ApiError, httpx.HTTPError, ValueError) as exc:
             logs.error(exc, stage="list")
-            health.error(exc)
             result.listing_failed += 1
             continue
         logs.event("listed", tournament=tournament, open=len(found), unsupported=unsupported)
@@ -90,11 +89,9 @@ async def run_pass(ctx: Context, tournaments: list[str], health: Health,
             except ModelAccessError as exc:
                 result.access_failure = True
                 logs.error(exc, stage="forecast", question_id=question.id, question_type=question.type)
-                health.error(exc)
                 return "failed"
             except Exception as exc:  # one question's error never stops the others
                 logs.error(exc, stage="forecast", question_id=question.id, question_type=question.type)
-                health.error(exc)
                 return "failed"
 
     ordered = list(questions.values())
@@ -135,7 +132,8 @@ async def run_forever(ctx: Context, tournaments: list[str], health: Health,
             result = await asyncio.wait_for(run_pass(ctx, tournaments, health), PASS_TIMEOUT_SECONDS)
         except asyncio.TimeoutError:
             logs.event("exit", reason="pass_timeout")
-            health.write(tournaments, ctx.budget, None, None, 0, state="pass_timeout")
+            health.write(tournaments, ctx.budget, None, None, 0, state="pass_timeout",
+                         models_out=models_out(ctx))
             return EXIT_PASS_TIMEOUT
         elapsed = time.monotonic() - started
         credit = await ctx.models.credit_left()
@@ -153,18 +151,21 @@ async def run_forever(ctx: Context, tournaments: list[str], health: Health,
         else:
             all_failing, failing_ids = 0, set()
         if ctx.budget.mode == "stopped" or result.outcomes.get("budget"):
-            health.write(tournaments, ctx.budget, credit, elapsed, result.open_now, state="budget_spent")
+            health.write(tournaments, ctx.budget, credit, elapsed, result.open_now, state="budget_spent",
+                         models_out=models_out(ctx))
             logs.event("exit", reason="budget")
             return EXIT_BUDGET
         if access_failures >= FAILURES_TO_EXIT:
-            health.write(tournaments, ctx.budget, credit, elapsed, result.open_now, state="access_failure")
+            health.write(tournaments, ctx.budget, credit, elapsed, result.open_now, state="access_failure",
+                         models_out=models_out(ctx))
             logs.event("exit", reason="access")
             return EXIT_ACCESS
         if all_failing >= FAILURES_TO_EXIT and len(failing_ids) >= 2:
-            health.write(tournaments, ctx.budget, credit, elapsed, result.open_now, state="all_failing")
+            health.write(tournaments, ctx.budget, credit, elapsed, result.open_now, state="all_failing",
+                         models_out=models_out(ctx))
             logs.event("exit", reason="all_failing")
             return EXIT_ALL_FAILING
-        health.write(tournaments, ctx.budget, credit, elapsed, result.open_now)
+        health.write(tournaments, ctx.budget, credit, elapsed, result.open_now, models_out=models_out(ctx))
         if max_passes is not None and passes >= max_passes:
             return 0
         now = datetime.now(timezone.utc)

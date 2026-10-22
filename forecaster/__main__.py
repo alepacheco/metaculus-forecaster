@@ -4,10 +4,11 @@
   python -m forecaster pass [--tournament SLUG ...] [--allow-update]
                                            one pass now (--allow-update only in the testing area)
   python -m forecaster dry-run --tournament SLUG --out DIR [--per-type N] [--budget USD] [--backtest]
-                                           forecast closed or resolved questions without posting
+                             [--no-news]   forecast closed or resolved questions without posting
   python -m forecaster analyse [--records DIR]
                                            scores on resolved questions
-  python -m forecaster check               are the keys working (prints ok or failed per key)
+  python -m forecaster check [--models]    are the keys working (prints ok or failed per key), and
+                                           does each no-cost model answer a short neutral request
 """
 
 from __future__ import annotations
@@ -24,9 +25,9 @@ from .analyse import analyse
 from .budget import Budget
 from .config import load_config, load_secrets
 from .health import Health
-from .llm import ModelClient
+from .llm import Member, ModelClient, ModelError
 from .metaculus import MetaculusClient, Question
-from .pipeline import Context, forecast_question
+from .pipeline import FREE, FREE_RESERVE, Context, forecast_question, models_out
 from .records import Records
 from .research import NewsClient
 from .runner import run_forever, run_pass
@@ -61,6 +62,15 @@ def _hold_lock(live_dir: Path):
 async def cmd_run(args) -> int:
     config = load_config()
     logs.setup(config.live_dir / "bot.log")
+    tournaments = config.tournaments
+    if args.command == "pass":
+        tournaments = args.tournament or config.tournaments
+        if any(t not in config.tournaments and t != TESTING_AREA for t in tournaments):
+            print("a pass takes only the config's tournaments or the testing area", file=sys.stderr)
+            return 1
+        if args.allow_update and tournaments != [TESTING_AREA]:
+            print("--allow-update is only for the testing area", file=sys.stderr)
+            return 1
     lock = _hold_lock(config.live_dir)
     if lock is None:
         logs.event("exit", reason="already_running")
@@ -73,13 +83,10 @@ async def cmd_run(args) -> int:
     logs.event("start", tournaments=len(config.tournaments), budget_mode=budget.mode)
     try:
         if args.command == "pass":
-            tournaments = args.tournament or config.tournaments
-            if args.allow_update and tournaments != [TESTING_AREA]:
-                print("--allow-update is only for the testing area", file=sys.stderr)
-                return 1
             ctx.allow_update = args.allow_update
             result = await run_pass(ctx, tournaments, health)
-            health.write(tournaments, budget, await models.credit_left(), None, result.open_now)
+            health.write(tournaments, budget, await models.credit_left(), None, result.open_now,
+                         models_out=models_out(ctx))
             return 0 if not result.failed else 1
         return await run_forever(ctx, config.tournaments, health)
     finally:
@@ -93,6 +100,8 @@ async def cmd_dry_run(args) -> int:
     out.mkdir(parents=True, exist_ok=True)
     logs.setup(out / "dry-run.log")
     budget = Budget(out / "ledger.json", "dry-run", args.budget, args.per_question_cap)
+    if args.no_news:
+        secrets.pop("ASKNEWS_API_KEY", None)
     api, models, news = _clients(secrets, budget)
     ctx = Context(api=api, models=models, news=news, budget=budget, records=Records(out / "records"),
                   post=False, backtest=args.backtest)
@@ -164,10 +173,30 @@ async def cmd_check(args) -> int:
                 status["asknews"] = "ok"
             except Exception as exc:
                 status["asknews"] = f"failed:{type(exc).__name__}"
+        if args.models:
+            # Each no-cost model, asked something that is no question: does it answer at all?
+            listed = await models.listed_models()
+            probes = {}
+            for model in dict.fromkeys(m.model for m in FREE + FREE_RESERVE):
+                probes[model] = await _probe(models, model, listed)
+            status["models"] = probes
     finally:
         await _close(api, models, news)
     print(json.dumps(status))
-    return 0 if all(v == "ok" or k == "openrouter_credit_usd" for k, v in status.items()) else 1
+    return 0 if all(v == "ok" or k in ("openrouter_credit_usd", "models") for k, v in status.items()) else 1
+
+
+async def _probe(models: ModelClient, model: str, listed: set[str] | None) -> str:
+    if listed is not None and model not in listed:
+        return "unlisted"
+    try:
+        await models.complete(0, Member(model, "low", max_tokens=4000, estimate_usd=0.0),
+                              "Reply with the single word: ready")
+        return "ok"
+    except ModelError as exc:
+        return f"failed:{exc.status}" + (f":{exc.reason}" if exc.reason else "")
+    except Exception as exc:
+        return f"failed:{type(exc).__name__}"
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -186,11 +215,14 @@ def main(argv: list[str] | None = None) -> int:
     d.add_argument("--budget", type=float, default=5.0)
     d.add_argument("--per-question-cap", type=float, default=2.0)
     d.add_argument("--backtest", action="store_true")
+    d.add_argument("--no-news", action="store_true")
     for name in ("dry-run", "analyse", "check"):
         s = d if name == "dry-run" else sub.add_parser(name)
         s.add_argument("--secret-file", default="/secret/bot.env")
         if name == "analyse":
             s.add_argument("--records")
+        if name == "check":
+            s.add_argument("--models", action="store_true")
     args = parser.parse_args(argv)
     command = {"run": cmd_run, "pass": cmd_run, "dry-run": cmd_dry_run,
                "analyse": cmd_analyse, "check": cmd_check}[args.command]

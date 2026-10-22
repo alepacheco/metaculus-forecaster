@@ -4,7 +4,8 @@ The log is read by the bot's keepers while questions are open, so it must never 
 forecast, a probability, a model's text or an exception message (which can quote a model).
 `event` accepts numbers, booleans and short identifiers; anything else is replaced.
 `error` records an exception's type, the file and line in this package where it surfaced,
-the question id and the question type, never its message; an HTTP failure adds its status code.
+the question id and the question type, never its message; an HTTP failure adds its status code,
+an empty model reply its finish reason, and a forecaster's error its model.
 """
 
 from __future__ import annotations
@@ -21,6 +22,7 @@ _LOGGER = logging.getLogger("forecaster")
 _SAFE_TEXT = re.compile(r"^[A-Za-z0-9_\-./:]{0,64}$")
 _PACKAGE_DIR = Path(__file__).resolve().parent
 _RECENT: list[tuple[float, str]] = []  # (time, "stage:type[:status]") of each error logged
+_LAST: dict[str, str] = {}  # the last error's type and time, for health.json
 
 
 def setup(log_file: Path | None) -> None:
@@ -70,7 +72,8 @@ def error_location(exc: BaseException) -> str:
     return where
 
 
-def error(exc: BaseException, stage: str, question_id: int | None = None, question_type: str | None = None) -> None:
+def error(exc: BaseException, stage: str, question_id: int | None = None, question_type: str | None = None,
+          model: str | None = None) -> None:
     parts = [
         "event=error",
         f"type={_safe(type(exc).__name__)}",
@@ -79,13 +82,24 @@ def error(exc: BaseException, stage: str, question_id: int | None = None, questi
         f"qid={_safe(question_id)}",
         f"qtype={_safe(question_type)}",
     ]
+    if model:
+        parts.append(f"model={_safe(model)}")
     key = f"{_safe(stage)}:{_safe(type(exc).__name__)}"
     status = getattr(exc, "status", None)
     if isinstance(status, int) and not isinstance(status, bool):
         parts.append(f"status={status}")
         key += f":{status}"
+    reason = getattr(exc, "reason", None)
+    if isinstance(reason, str):
+        parts.append(f"reason={_safe(reason)}")
     _RECENT.append((time.time(), key))
+    _LAST.update(type=type(exc).__name__, at=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()))
     _LOGGER.warning(" ".join(parts))
+
+
+def last_error() -> tuple[str | None, str | None]:
+    """The type and time of the last error logged, at any stage."""
+    return _LAST.get("type"), _LAST.get("at")
 
 
 def recent_errors(window: float = 86400) -> dict[str, int]:

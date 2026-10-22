@@ -19,8 +19,11 @@ a private comment explaining it. Nobody reviews or edits a forecast.
 - MiniBench questions, and every question once 80% of the season's budget is spent, use a
   cheaper ensemble without the web-search brief.
 - With a season budget of 0 it makes no paid calls at all: five forecasts from models offered
-  at no cost (three labs), news search as its only research, and it stops if a call is ever
-  charged.
+  at no cost, news search as its only research, and it stops if a call is ever charged.
+- **Withdrawn models**: the provider's list of offered models is read every hour. A forecaster
+  whose model is gone (no longer listed, past its listed expiry, or answering "not found") is
+  replaced at once, in the same question, by the next model of a reserve that is still offered,
+  else by another member of the ensemble, so the ensemble keeps its five forecasts.
 
 ## Running it
 
@@ -42,15 +45,19 @@ budget_label = "fall-2026"
 Commands: `python -m forecaster run | pass | dry-run | analyse | check` (see
 `forecaster/__main__.py`). `dry-run` forecasts closed or resolved questions without posting;
 with `--backtest` its research is limited to news published before each question opened and
-web search is off. `analyse` scores the bot on resolved questions.
+web search is off, and `--no-news` leaves the news search out. `analyse` scores the bot on
+resolved questions. `check --models` also asks each no-cost model a short neutral request to
+see that it answers.
 
 ## What it writes
 
 - `live/health.json` each pass: counts of questions seen, done, skipped and failed in the last
-  24 hours, spend, credit left, budget warning, the last error's type, and the errors of the
-  last 24 hours counted by stage, type and HTTP status.
+  24 hours, spend, credit left, budget warning, the last error's type, the errors of the last
+  24 hours counted by stage (a forecaster's by its place in the ensemble), type and HTTP status,
+  and the models out (withdrawn by the provider and replaced).
 - `live/bot.log`: the same counts, and errors as their type, place, question id and type (and
-  HTTP status, for a failed request).
+  HTTP status for a failed request, the model for a forecaster's error, the finish reason for
+  an empty reply).
 - `live/records/<question id>.json`: each question's full record, used by the bot to finish a
   question interrupted mid-way and by `analyse` once the question has closed.
 
